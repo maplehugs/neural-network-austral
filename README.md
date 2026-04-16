@@ -112,10 +112,15 @@ python stockout_forecasting.py
 El pipeline guarda automáticamente artefactos en `artifacts/`:
 
 - `gru_model.keras`, `scaler.pkl`, `metadata.json`
+  - Modelo GRU entrenado, scaler de features y metadatos de configuración.
 - `threshold_metrics.csv`, `calibration_summary.json`, `calibrator.pkl`
+  - Barrido de umbrales, calidad de calibración (Brier) y calibrador seleccionado.
 - `predicciones_por_sku.csv`, `benchmark_business_metrics.csv`
+  - Predicciones/probabilidades por día y métricas de negocio GRU vs Croston.
 - `stockout_riesgo_skus.csv`, `analisis_sesgo_por_sku.csv`
+  - Ranking de riesgo de quiebre y diagnóstico de sobre/subpredicción por SKU.
 - `resultados_inventario.png`, `analisis_por_sku.png`, `run_summary.json`
+  - Visualizaciones clave y resumen agregado de métricas finales.
 
 Para reutilizar modelo/scaler sin reentrenar:
 
@@ -144,4 +149,3 @@ python stockout_forecasting.py
 - Si faltan dias en MySQL, `mysql_inventory_loader.py` completa la serie diaria por SKU.
 - `consumo` se infiere como caida diaria de stock (`stock_t-1 - stock_t`, truncado en 0).
 - Si MySQL falla o no hay datos utiles, `stockout_forecasting.py` cae a datos sinteticos para no bloquear el flujo.
-

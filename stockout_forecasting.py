@@ -22,6 +22,7 @@ warnings.filterwarnings("ignore")
 import os
 import json
 import pickle
+import hashlib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -34,7 +35,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (accuracy_score, precision_score, recall_score,
                              f1_score, roc_auc_score, mean_absolute_error,
-                             brier_score_loss, precision_recall_curve)
+                             brier_score_loss, precision_recall_curve, confusion_matrix)
 from sklearn.model_selection import train_test_split
 
 import tensorflow as tf
@@ -56,6 +57,10 @@ MC_ALL_SIMS = int(os.getenv("STOCKOUT_MC_ALL_SIMS", "300" if not QUICK_MODE else
 ARTIFACT_DIR = Path(os.getenv("STOCKOUT_ARTIFACT_DIR", "artifacts"))
 LOAD_EXISTING_MODEL = os.getenv("STOCKOUT_LOAD_MODEL", "0").strip() == "1"
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+
+EPSILON = 1e-6
+CROSTON_SEED_OFFSET = 1000
+TRAIN_CUTOFF_RATIO = 0.85
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. GENERACIÓN DE DATOS SINTÉTICOS
@@ -336,9 +341,13 @@ scaler = StandardScaler()
 n_tr, seq, n_feat = X_tr.shape
 X_tr_raw, X_val_raw, X_te_raw = X_tr.copy(), X_val.copy(), X_te.copy()
 
+def transform_sequences(X_data, scaler_obj, n_feat_local, seq_local):
+    return scaler_obj.transform(X_data.reshape(-1, n_feat_local)).reshape(-1, seq_local, n_feat_local).astype(np.float32)
+
+
 X_tr = scaler.fit_transform(X_tr_raw.reshape(-1, n_feat)).reshape(-1, seq, n_feat).astype(np.float32)
-X_val = scaler.transform(X_val_raw.reshape(-1, n_feat)).reshape(-1, seq, n_feat).astype(np.float32)
-X_te = scaler.transform(X_te_raw.reshape(-1, n_feat)).reshape(-1, seq, n_feat).astype(np.float32)
+X_val = transform_sequences(X_val_raw, scaler, n_feat, seq)
+X_te = transform_sequences(X_te_raw, scaler, n_feat, seq)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -453,9 +462,9 @@ if LOAD_EXISTING_MODEL:
         print(f"[LOAD] Modelo y scaler cargados desde {ARTIFACT_DIR.resolve()}")
         model = loaded_model
         scaler = loaded_scaler
-        X_tr = scaler.transform(X_tr_raw.reshape(-1, n_feat)).reshape(-1, seq, n_feat).astype(np.float32)
-        X_val = scaler.transform(X_val_raw.reshape(-1, n_feat)).reshape(-1, seq, n_feat).astype(np.float32)
-        X_te = scaler.transform(X_te_raw.reshape(-1, n_feat)).reshape(-1, seq, n_feat).astype(np.float32)
+        X_tr = transform_sequences(X_tr_raw, scaler, n_feat, seq)
+        X_val = transform_sequences(X_val_raw, scaler, n_feat, seq)
+        X_te = transform_sequences(X_te_raw, scaler, n_feat, seq)
         loaded_ok = True
     else:
         print(f"[LOAD] No hay artefactos en {ARTIFACT_DIR.resolve()}, se entrena desde cero.")
@@ -528,7 +537,7 @@ def sweep_thresholds(y_true, prob, thresholds=None):
 
 
 def fit_calibrators(y_val, p_val):
-    p_val = np.clip(np.array(p_val).astype(float), 1e-6, 1 - 1e-6)
+    p_val = np.clip(np.array(p_val).astype(float), EPSILON, 1 - EPSILON)
     y_val = np.array(y_val).astype(int)
 
     platt = LogisticRegression(max_iter=1000)
@@ -619,7 +628,7 @@ def croston_sba(series: np.ndarray,
     }
 
 
-def stockout_day(consumos: np.ndarray, stock_inicial: float, horizon: int):
+def calculate_stockout_day(consumos: np.ndarray, stock_inicial: float, horizon: int):
     stock = float(stock_inicial)
     for day, c in enumerate(consumos[:horizon], start=1):
         stock -= float(c)
@@ -637,7 +646,8 @@ def simulate_stockout_probability(prob_sale, qty_mu, stock_inicial, n_sim=300, s
         stockout_day = None
         for day in range(horizon):
             if rng.random() < prob_sale[day] and stock > 0:
-                q = max(1, rng.poisson(max(qty_mu[day], 1e-6)))
+                safe_mu = max(qty_mu[day], EPSILON)
+                q = max(1, rng.poisson(safe_mu))
                 stock -= min(stock, q)
                 if stock <= 0:
                     stockout_day = day + 1
@@ -660,7 +670,7 @@ def evaluate_business_benchmark(df_feat, model, scaler, feature_cols, seq_len,
     for idx, (sku, grp) in enumerate(sku_iter):
         grp = grp.sort_values("fecha").reset_index(drop=True)
         n = len(grp)
-        cutoff = int(n * 0.85)
+        cutoff = int(n * TRAIN_CUTOFF_RATIO)
         if cutoff < seq_len or cutoff >= n:
             continue
 
@@ -691,18 +701,27 @@ def evaluate_business_benchmark(df_feat, model, scaler, feature_cols, seq_len,
         q_croston = np.full(horizon_eff, max(0.0, sba["avg_qty"]), dtype=float)
         exp_cons_croston = p_croston * q_croston
 
-        actual_day, actual_stockout = stockout_day(test_cons, stock_ini, horizon_eff)
-        pred_day_gru, _ = stockout_day(exp_cons_gru, stock_ini, horizon_eff)
-        pred_day_croston, _ = stockout_day(exp_cons_croston, stock_ini, horizon_eff)
+        actual_day, actual_stockout = calculate_stockout_day(test_cons, stock_ini, horizon_eff)
+        pred_day_gru, _ = calculate_stockout_day(exp_cons_gru, stock_ini, horizon_eff)
+        pred_day_croston, _ = calculate_stockout_day(exp_cons_croston, stock_ini, horizon_eff)
 
-        prob_gru, dist_gru = simulate_stockout_probability(p_gru, np.maximum(q_gru, 1e-3), stock_ini, n_sim=n_simulations, seed=idx)
+        sku_seed = int(hashlib.sha256(str(sku).encode("utf-8")).hexdigest()[:8], 16)
+        prob_gru, dist_gru = simulate_stockout_probability(
+            p_gru, np.maximum(q_gru, EPSILON), stock_ini, n_sim=n_simulations, seed=sku_seed
+        )
         prob_croston, dist_croston = simulate_stockout_probability(
-            p_croston, np.maximum(q_croston, 1e-3), stock_ini, n_sim=n_simulations, seed=1000 + idx
+            p_croston, np.maximum(q_croston, EPSILON), stock_ini, n_sim=n_simulations,
+            seed=CROSTON_SEED_OFFSET + sku_seed
         )
 
         y_true_sale = (test_cons > 0).astype(int)
-        fp = int(((labels_gru == 1) & (y_true_sale == 0)).sum())
-        fn = int(((labels_gru == 0) & (y_true_sale == 1)).sum())
+        tn, fp, fn, tp = confusion_matrix(y_true_sale, labels_gru, labels=[0, 1]).ravel()
+        if fp > fn:
+            bias_label = "sobrepredice"
+        elif fn > fp:
+            bias_label = "subpredice"
+        else:
+            bias_label = "balanceado"
 
         summary_rows.append({
             "sku": sku,
@@ -727,7 +746,7 @@ def evaluate_business_benchmark(df_feat, model, scaler, feature_cols, seq_len,
             "f1_gru": f1_score(y_true_sale, labels_gru, zero_division=0),
             "fp_gru": fp,
             "fn_gru": fn,
-            "sesgo_gru": "sobrepredice" if fp > fn else ("subpredice" if fn > fp else "balanceado"),
+            "sesgo_gru": bias_label,
             "stockout_days_gru": ";".join(map(str, dist_gru)),
             "stockout_days_croston": ";".join(map(str, dist_croston)),
         })
@@ -757,7 +776,10 @@ df_compare, df_daily_pred = evaluate_business_benchmark(
 )
 
 if df_compare.empty:
-    raise ValueError("No se pudo construir benchmark de negocio: no hay SKUs evaluables.")
+    raise ValueError(
+        "No se pudo construir benchmark de negocio: no hay SKUs evaluables "
+        "(causas comunes: cutoff<seq_len, SKUs sin tramo de test o historial insuficiente)."
+    )
 
 df_compare.to_csv(ARTIFACT_DIR / "benchmark_business_metrics.csv", index=False)
 df_daily_pred.to_csv(ARTIFACT_DIR / "predicciones_por_sku.csv", index=False)
@@ -847,6 +869,7 @@ def montecarlo_stockout(sku_id: str,
 
 
 TARGET_SKU = str(df_feat["sku"].iloc[0])
+target_df = df_feat[df_feat["sku"] == TARGET_SKU].copy()
 resultado = montecarlo_stockout(
     sku_id=TARGET_SKU, df_feat=df_feat, model=model, scaler=scaler,
     feature_cols=FEATURE_COLS, seq_len=SEQ_LEN, horizon=30,
@@ -895,6 +918,8 @@ ax = axes[0, 0]
 if history is not None:
     ax.plot(history.history["loss"], label="Train loss", color="#3b82f6")
     ax.plot(history.history["val_loss"], label="Val loss", color="#ef4444", linestyle="--")
+else:
+    ax.text(0.5, 0.5, "Modelo cargado desde artefactos\n(sin reentrenar)", ha="center", va="center")
 ax.set_title("Pérdida de entrenamiento"); ax.set_xlabel("Época"); ax.set_ylabel("Loss"); ax.grid(alpha=0.3); ax.legend()
 
 ax = axes[0, 1]
@@ -922,7 +947,7 @@ plt.close()
 
 fig2, axes2 = plt.subplots(1, 2, figsize=(14, 5))
 if not daily_target.empty:
-    stock_ini = float(df_feat[df_feat["sku"] == TARGET_SKU]["stock"].iloc[int(len(df_feat[df_feat["sku"] == TARGET_SKU]) * 0.85) - 1])
+    stock_ini = float(target_df["stock"].iloc[int(len(target_df) * TRAIN_CUTOFF_RATIO) - 1])
     real_stock = stock_ini - daily_target["consumo_real"].cumsum()
     gru_stock = stock_ini - daily_target["consumo_esperado_gru"].cumsum()
     axes2[0].plot(daily_target["fecha"], real_stock, label="Stock real", color="#111827")
@@ -930,7 +955,12 @@ if not daily_target.empty:
 axes2[0].set_title(f"Stock real vs simulado ({TARGET_SKU})"); axes2[0].grid(alpha=0.3); axes2[0].legend()
 
 sesgo_counts = sku_analysis["sesgo_gru"].value_counts()
-axes2[1].bar(sesgo_counts.index, sesgo_counts.values, color=["#ef4444", "#f59e0b", "#22c55e"][:len(sesgo_counts)])
+bias_color_map = {"sobrepredice": "#ef4444", "subpredice": "#f59e0b", "balanceado": "#22c55e"}
+axes2[1].bar(
+    sesgo_counts.index,
+    sesgo_counts.values,
+    color=[bias_color_map.get(cat, "#6b7280") for cat in sesgo_counts.index]
+)
 axes2[1].set_title("Sesgo de clasificación GRU por SKU"); axes2[1].grid(alpha=0.3, axis="y")
 plt.tight_layout()
 plt.savefig(ARTIFACT_DIR / "analisis_por_sku.png", dpi=150, bbox_inches="tight")
