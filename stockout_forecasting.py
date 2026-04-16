@@ -20,15 +20,22 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import os
+import json
+import pickle
+import hashlib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import timedelta
+from pathlib import Path
 
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (accuracy_score, precision_score, recall_score,
-                             f1_score, roc_auc_score, mean_absolute_error)
+                             f1_score, roc_auc_score, mean_absolute_error,
+                             brier_score_loss, precision_recall_curve, confusion_matrix)
 from sklearn.model_selection import train_test_split
 
 import tensorflow as tf
@@ -40,6 +47,20 @@ from tensorflow.keras.optimizers import Adam
 
 tf.random.set_seed(42)
 np.random.seed(42)
+
+QUICK_MODE = os.getenv("STOCKOUT_QUICK_MODE", "0").strip() == "1"
+TRAIN_EPOCHS = int(os.getenv("STOCKOUT_TRAIN_EPOCHS", "60" if not QUICK_MODE else "6"))
+BENCHMARK_MAX_SKUS = int(os.getenv("STOCKOUT_BENCHMARK_MAX_SKUS", "0"))
+MC_TARGET_SIMS = int(os.getenv("STOCKOUT_MC_TARGET_SIMS", "500" if not QUICK_MODE else "80"))
+MC_ALL_SIMS = int(os.getenv("STOCKOUT_MC_ALL_SIMS", "300" if not QUICK_MODE else "40"))
+
+ARTIFACT_DIR = Path(os.getenv("STOCKOUT_ARTIFACT_DIR", "artifacts"))
+LOAD_EXISTING_MODEL = os.getenv("STOCKOUT_LOAD_MODEL", "0").strip() == "1"
+ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+
+EPSILON = 1e-6
+CROSTON_SEED_OFFSET = 1000
+TRAIN_CUTOFF_RATIO = 0.85
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. GENERACIÓN DE DATOS SINTÉTICOS
@@ -318,10 +339,15 @@ def temporal_split(X, y_clf, y_reg,
 # Escalar features (fit solo en train para no filtrar info futura)
 scaler = StandardScaler()
 n_tr, seq, n_feat = X_tr.shape
+X_tr_raw, X_val_raw, X_te_raw = X_tr.copy(), X_val.copy(), X_te.copy()
 
-X_tr  = scaler.fit_transform(X_tr.reshape(-1, n_feat)).reshape(-1, seq, n_feat).astype(np.float32)
-X_val = scaler.transform(X_val.reshape(-1, n_feat)).reshape(-1, seq, n_feat).astype(np.float32)
-X_te  = scaler.transform(X_te.reshape(-1, n_feat)).reshape(-1, seq, n_feat).astype(np.float32)
+def transform_sequences(X_data, scaler_obj, n_feat_local, seq_local):
+    return scaler_obj.transform(X_data.reshape(-1, n_feat_local)).reshape(-1, seq_local, n_feat_local).astype(np.float32)
+
+
+X_tr = scaler.fit_transform(X_tr_raw.reshape(-1, n_feat)).reshape(-1, seq, n_feat).astype(np.float32)
+X_val = transform_sequences(X_val_raw, scaler, n_feat, seq)
+X_te = transform_sequences(X_te_raw, scaler, n_feat, seq)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -405,15 +431,61 @@ lr_scheduler = callbacks.ReduceLROnPlateau(
 )
 
 print("\n[TRAIN] Entrenando GRU dual-output...")
-history = model.fit(
-    X_tr,
-    {"output_clf": y_clf_tr, "output_reg": y_reg_tr},
-    validation_data=(X_val, {"output_clf": y_clf_val, "output_reg": y_reg_val}),
-    epochs=60,
-    batch_size=128,
-    callbacks=[early_stop, lr_scheduler],
-    verbose=1
-)
+
+def save_artifacts(model_obj, scaler_obj, metadata: dict):
+    model_obj.save(ARTIFACT_DIR / "gru_model.keras")
+    with open(ARTIFACT_DIR / "scaler.pkl", "wb") as f:
+        pickle.dump(scaler_obj, f)
+    with open(ARTIFACT_DIR / "metadata.json", "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+
+def load_artifacts():
+    model_path = ARTIFACT_DIR / "gru_model.keras"
+    scaler_path = ARTIFACT_DIR / "scaler.pkl"
+    meta_path = ARTIFACT_DIR / "metadata.json"
+    if not (model_path.exists() and scaler_path.exists() and meta_path.exists()):
+        return None, None, None
+    loaded_model = tf.keras.models.load_model(model_path)
+    with open(scaler_path, "rb") as f:
+        loaded_scaler = pickle.load(f)
+    with open(meta_path, "r", encoding="utf-8") as f:
+        metadata = json.load(f)
+    return loaded_model, loaded_scaler, metadata
+
+
+history = None
+loaded_ok = False
+if LOAD_EXISTING_MODEL:
+    loaded_model, loaded_scaler, metadata = load_artifacts()
+    if loaded_model is not None:
+        print(f"[LOAD] Modelo y scaler cargados desde {ARTIFACT_DIR.resolve()}")
+        model = loaded_model
+        scaler = loaded_scaler
+        X_tr = transform_sequences(X_tr_raw, scaler, n_feat, seq)
+        X_val = transform_sequences(X_val_raw, scaler, n_feat, seq)
+        X_te = transform_sequences(X_te_raw, scaler, n_feat, seq)
+        loaded_ok = True
+    else:
+        print(f"[LOAD] No hay artefactos en {ARTIFACT_DIR.resolve()}, se entrena desde cero.")
+
+if not loaded_ok:
+    history = model.fit(
+        X_tr,
+        {"output_clf": y_clf_tr, "output_reg": y_reg_tr},
+        validation_data=(X_val, {"output_clf": y_clf_val, "output_reg": y_reg_val}),
+        epochs=TRAIN_EPOCHS,
+        batch_size=128,
+        callbacks=[early_stop, lr_scheduler],
+        verbose=1
+    )
+    save_artifacts(model, scaler, {
+        "feature_cols": FEATURE_COLS,
+        "seq_len": SEQ_LEN,
+        "train_epochs": TRAIN_EPOCHS,
+        "quick_mode": QUICK_MODE,
+    })
+    print(f"[SAVE] Artefactos guardados en {ARTIFACT_DIR.resolve()}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -449,132 +521,284 @@ def evaluate_model(model, X_te, y_clf_te, y_reg_te,
     return pred_clf, pred_reg
 
 
-pred_clf_te, pred_reg_te = evaluate_model(model, X_te, y_clf_te, y_reg_te)
+def sweep_thresholds(y_true, prob, thresholds=None):
+    if thresholds is None:
+        thresholds = np.arange(0.1, 1.0, 0.1)
+    rows = []
+    for t in thresholds:
+        pred = (prob >= t).astype(int)
+        rows.append({
+            "threshold": round(float(t), 2),
+            "precision": precision_score(y_true, pred, zero_division=0),
+            "recall": recall_score(y_true, pred, zero_division=0),
+            "f1": f1_score(y_true, pred, zero_division=0),
+        })
+    return pd.DataFrame(rows)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 8. BENCHMARK: CROSTON / SBA
-# ─────────────────────────────────────────────────────────────────────────────
-# Croston descompone la demanda intermitente en:
-#   - z_t: tamaño de la demanda cuando ocurre
-#   - p_t: intervalo entre demandas
-# SBA (Syntetos-Boylan Approximation) agrega un factor corrector de sesgo.
-# ─────────────────────────────────────────────────────────────────────────────
+def fit_calibrators(y_val, p_val):
+    p_val = np.clip(np.array(p_val).astype(float), EPSILON, 1 - EPSILON)
+    y_val = np.array(y_val).astype(int)
+
+    platt = LogisticRegression(max_iter=1000)
+    platt.fit(p_val.reshape(-1, 1), y_val)
+    p_platt = platt.predict_proba(p_val.reshape(-1, 1))[:, 1]
+
+    isotonic = IsotonicRegression(out_of_bounds="clip")
+    isotonic.fit(p_val, y_val)
+    p_iso = isotonic.predict(p_val)
+
+    scores = {
+        "raw": brier_score_loss(y_val, p_val),
+        "platt": brier_score_loss(y_val, p_platt),
+        "isotonic": brier_score_loss(y_val, p_iso),
+    }
+    best = min(scores, key=scores.get)
+    calibrator = None if best == "raw" else (platt if best == "platt" else isotonic)
+    return calibrator, best, scores
+
+
+def apply_calibration(prob, calibrator, method):
+    p = np.array(prob).astype(float).flatten()
+    if calibrator is None or method == "raw":
+        return np.clip(p, 0.0, 1.0)
+    if method == "platt":
+        return np.clip(calibrator.predict_proba(p.reshape(-1, 1))[:, 1], 0.0, 1.0)
+    return np.clip(calibrator.predict(p), 0.0, 1.0)
+
+
+pred_clf_val_raw, pred_reg_val = model.predict(X_val, verbose=0)
+pred_clf_val_raw = pred_clf_val_raw.flatten()
+calibrator, calibration_method, calibration_scores = fit_calibrators(y_clf_val, pred_clf_val_raw)
+
+threshold_table = sweep_thresholds(
+    y_clf_val,
+    apply_calibration(pred_clf_val_raw, calibrator, calibration_method)
+)
+best_row = threshold_table.sort_values(["f1", "recall", "precision"], ascending=False).iloc[0]
+BEST_THRESHOLD = float(best_row["threshold"])
+
+threshold_table.to_csv(ARTIFACT_DIR / "threshold_metrics.csv", index=False)
+with open(ARTIFACT_DIR / "calibration_summary.json", "w", encoding="utf-8") as f:
+    json.dump({
+        "method": calibration_method,
+        "brier_scores": calibration_scores,
+        "best_threshold": BEST_THRESHOLD,
+    }, f, ensure_ascii=False, indent=2)
+
+if calibrator is not None:
+    with open(ARTIFACT_DIR / "calibrator.pkl", "wb") as f:
+        pickle.dump({"method": calibration_method, "model": calibrator}, f)
+
+pred_clf_te_raw, pred_reg_te = evaluate_model(model, X_te, y_clf_te, y_reg_te, clf_threshold=BEST_THRESHOLD)
+pred_clf_te = apply_calibration(pred_clf_te_raw, calibrator, calibration_method)
+test_labels = (pred_clf_te >= BEST_THRESHOLD).astype(int)
+
+print(f"\n[THRESHOLD] Umbral óptimo por F1 en validación: {BEST_THRESHOLD:.2f}")
+print(f"[CALIBRATION] Método seleccionado: {calibration_method} | Brier: {calibration_scores}")
+print(f"[TEST] Precision={precision_score(y_clf_te, test_labels, zero_division=0):.4f} "
+      f"Recall={recall_score(y_clf_te, test_labels, zero_division=0):.4f} "
+      f"F1={f1_score(y_clf_te, test_labels, zero_division=0):.4f}")
+
 
 def croston_sba(series: np.ndarray,
                 alpha: float = 0.1,
                 use_sba: bool = True) -> dict:
-    """
-    Ajusta Croston o SBA sobre una serie de consumo histórico.
-    Devuelve la demanda estimada por período.
-    """
     series = np.array(series, dtype=float)
-    n = len(series)
-
     z = series[series > 0]
     if len(z) == 0:
-        return {
-            "demand_rate": 0.0,
-            "avg_qty": 0.0,
-            "avg_interval": float("inf"),
-            "prob_sale": 0.0,
-            "intervals": [],
-        }
+        return {"demand_rate": 0.0, "avg_qty": 0.0, "avg_interval": float("inf"), "prob_sale": 0.0}
 
-    # Inicialización
     z_hat = z[0]
     p_hat = 1.0
-
     non_zero_idx = np.where(series > 0)[0]
-    intervals = []
-    if len(non_zero_idx) > 1:
-        intervals = np.diff(non_zero_idx).tolist()
-
     for i in range(1, len(non_zero_idx)):
-        q = non_zero_idx[i] - non_zero_idx[i-1]
+        q = non_zero_idx[i] - non_zero_idx[i - 1]
         z_actual = series[non_zero_idx[i]]
         z_hat = alpha * z_actual + (1 - alpha) * z_hat
-        p_hat = alpha * q       + (1 - alpha) * p_hat
+        p_hat = alpha * q + (1 - alpha) * p_hat
 
-    # Factor SBA: corrige el sesgo de sobreestimación de Croston
     factor = (1 - alpha / 2) if use_sba else 1.0
     demand_rate = (z_hat / p_hat) * factor
-
     return {
-        "demand_rate": demand_rate,   # unidades esperadas por período
-        "avg_qty":     z_hat,
+        "demand_rate": demand_rate,
+        "avg_qty": z_hat,
         "avg_interval": p_hat,
-        "prob_sale":   min(1.0, 1.0 / p_hat)  # P(venta en un día)
+        "prob_sale": min(1.0, 1.0 / p_hat)
     }
 
 
-def evaluate_croston_vs_gru(df_feat, model, scaler, feature_cols,
-                             seq_len, clf_threshold=0.5):
-    """
-    Compara Croston/SBA vs GRU en términos de accuracy de clasificación
-    en el último 15% temporal de cada SKU.
-    """
-    resultados = []
+def calculate_stockout_day(consumos: np.ndarray, stock_inicial: float, horizon: int):
+    stock = float(stock_inicial)
+    for day, c in enumerate(consumos[:horizon], start=1):
+        stock -= float(c)
+        if stock <= 0:
+            return day, 1
+    return horizon + 1, 0
 
-    for sku, grp in df_feat.groupby("sku"):
+
+def simulate_stockout_probability(prob_sale, qty_mu, stock_inicial, n_sim=300, seed=0):
+    rng = np.random.default_rng(seed)
+    horizon = len(prob_sale)
+    stockout_days = []
+    for _ in range(n_sim):
+        stock = float(stock_inicial)
+        stockout_day = None
+        for day in range(horizon):
+            if rng.random() < prob_sale[day] and stock > 0:
+                safe_mu = max(qty_mu[day], EPSILON)
+                q = max(1, rng.poisson(safe_mu))
+                stock -= min(stock, q)
+                if stock <= 0:
+                    stockout_day = day + 1
+                    break
+        if stockout_day is not None:
+            stockout_days.append(stockout_day)
+    prob = len(stockout_days) / n_sim if n_sim > 0 else 0.0
+    return prob, stockout_days
+
+
+def evaluate_business_benchmark(df_feat, model, scaler, feature_cols, seq_len,
+                                calibrator=None, calibration_method="raw",
+                                clf_threshold=0.5, horizon=30, n_simulations=300,
+                                max_skus=0):
+    summary_rows, daily_rows = [], []
+    sku_iter = list(df_feat.groupby("sku"))
+    if max_skus > 0:
+        sku_iter = sku_iter[:max_skus]
+
+    for idx, (sku, grp) in enumerate(sku_iter):
         grp = grp.sort_values("fecha").reset_index(drop=True)
         n = len(grp)
-        cutoff = int(n * 0.85)
+        cutoff = int(n * TRAIN_CUTOFF_RATIO)
+        if cutoff < seq_len or cutoff >= n:
+            continue
+
+        horizon_eff = min(horizon, n - cutoff)
+        if horizon_eff <= 0:
+            continue
 
         train_series = grp["consumo"].values[:cutoff]
-        test_clf     = (grp["consumo"].values[cutoff:] > 0).astype(int)
-        if len(test_clf) == 0:
-            continue
+        test_cons = grp["consumo"].values[cutoff:cutoff + horizon_eff]
+        test_dates = grp["fecha"].iloc[cutoff:cutoff + horizon_eff].values
+        stock_ini = float(grp["stock"].iloc[cutoff - 1])
 
-        # Croston: predice la misma probabilidad para todo el período de test
-        sba = croston_sba(train_series, use_sba=True)
-        pred_croston = np.full(len(test_clf), sba.get("prob_sale", 0.0))
-        labels_croston = (pred_croston >= clf_threshold).astype(int)
-        acc_croston = accuracy_score(test_clf, labels_croston)
-
-        # GRU: solo si hay suficientes datos
-        if cutoff < seq_len:
-            continue
         feats = grp[feature_cols].values
         X_sku = []
-        for i in range(cutoff, min(cutoff + len(test_clf), n)):
-            if i >= seq_len:
-                X_sku.append(feats[i - seq_len:i])
-        if not X_sku:
-            continue
-        X_sku_arr = np.array(X_sku, dtype=np.float32)
-        X_sku_sc  = scaler.transform(X_sku_arr.reshape(-1, len(feature_cols)))
-        X_sku_sc  = X_sku_sc.reshape(-1, seq_len, len(feature_cols)).astype(np.float32)
+        for i in range(cutoff, cutoff + horizon_eff):
+            X_sku.append(feats[i - seq_len:i])
+        X_sku = np.array(X_sku, dtype=np.float32)
+        X_sku_sc = scaler.transform(X_sku.reshape(-1, len(feature_cols))).reshape(-1, seq_len, len(feature_cols))
 
-        p_clf, _ = model.predict(X_sku_sc, verbose=0)
-        labels_gru = (p_clf.flatten() >= clf_threshold).astype(int)
-        acc_gru = accuracy_score(test_clf[:len(labels_gru)], labels_gru)
+        p_raw, q_pred = model.predict(X_sku_sc, verbose=0)
+        p_gru = apply_calibration(p_raw.flatten(), calibrator, calibration_method)
+        q_gru = np.maximum(0.0, q_pred.flatten())
+        exp_cons_gru = p_gru * q_gru
+        labels_gru = (p_gru >= clf_threshold).astype(int)
 
-        resultados.append({
+        sba = croston_sba(train_series, use_sba=True)
+        p_croston = np.full(horizon_eff, sba["prob_sale"], dtype=float)
+        q_croston = np.full(horizon_eff, max(0.0, sba["avg_qty"]), dtype=float)
+        exp_cons_croston = p_croston * q_croston
+
+        actual_day, actual_stockout = calculate_stockout_day(test_cons, stock_ini, horizon_eff)
+        pred_day_gru, _ = calculate_stockout_day(exp_cons_gru, stock_ini, horizon_eff)
+        pred_day_croston, _ = calculate_stockout_day(exp_cons_croston, stock_ini, horizon_eff)
+
+        sku_seed = int(hashlib.sha256(str(sku).encode("utf-8")).hexdigest()[:8], 16)
+        prob_gru, dist_gru = simulate_stockout_probability(
+            p_gru, np.maximum(q_gru, EPSILON), stock_ini, n_sim=n_simulations, seed=sku_seed
+        )
+        prob_croston, dist_croston = simulate_stockout_probability(
+            p_croston, np.maximum(q_croston, EPSILON), stock_ini, n_sim=n_simulations,
+            seed=CROSTON_SEED_OFFSET + sku_seed
+        )
+
+        y_true_sale = (test_cons > 0).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y_true_sale, labels_gru, labels=[0, 1]).ravel()
+        if fp > fn:
+            bias_label = "sobrepredice"
+        elif fn > fp:
+            bias_label = "subpredice"
+        else:
+            bias_label = "balanceado"
+
+        summary_rows.append({
             "sku": sku,
-            "acc_croston_sba": acc_croston,
-            "acc_gru":         acc_gru,
-            "n_test":          len(test_clf),
-            "prob_sale_sba":   sba["prob_sale"]
+            "horizon": horizon_eff,
+            "actual_cum_consumo_30d": float(test_cons.sum()),
+            "pred_cum_consumo_gru_30d": float(exp_cons_gru.sum()),
+            "pred_cum_consumo_croston_30d": float(exp_cons_croston.sum()),
+            "mae_cum_consumo_gru": abs(float(test_cons.sum() - exp_cons_gru.sum())),
+            "mae_cum_consumo_croston": abs(float(test_cons.sum() - exp_cons_croston.sum())),
+            "actual_dia_agotamiento": actual_day,
+            "pred_dia_agotamiento_gru": pred_day_gru,
+            "pred_dia_agotamiento_croston": pred_day_croston,
+            "err_dia_agotamiento_gru": abs(pred_day_gru - actual_day),
+            "err_dia_agotamiento_croston": abs(pred_day_croston - actual_day),
+            "actual_stockout_flag": actual_stockout,
+            "prob_stockout_gru": prob_gru,
+            "prob_stockout_croston": prob_croston,
+            "err_prob_stockout_gru": abs(prob_gru - actual_stockout),
+            "err_prob_stockout_croston": abs(prob_croston - actual_stockout),
+            "precision_gru": precision_score(y_true_sale, labels_gru, zero_division=0),
+            "recall_gru": recall_score(y_true_sale, labels_gru, zero_division=0),
+            "f1_gru": f1_score(y_true_sale, labels_gru, zero_division=0),
+            "fp_gru": fp,
+            "fn_gru": fn,
+            "sesgo_gru": bias_label,
+            "stockout_days_gru": ";".join(map(str, dist_gru)),
+            "stockout_days_croston": ";".join(map(str, dist_croston)),
         })
 
-    return pd.DataFrame(resultados)
+        for j in range(horizon_eff):
+            daily_rows.append({
+                "sku": sku,
+                "fecha": pd.to_datetime(test_dates[j]),
+                "consumo_real": float(test_cons[j]),
+                "prob_venta_gru": float(p_gru[j]),
+                "qty_gru": float(q_gru[j]),
+                "consumo_esperado_gru": float(exp_cons_gru[j]),
+                "prob_venta_croston": float(p_croston[j]),
+                "qty_croston": float(q_croston[j]),
+                "consumo_esperado_croston": float(exp_cons_croston[j]),
+            })
+
+    return pd.DataFrame(summary_rows), pd.DataFrame(daily_rows)
 
 
-print("\n[BENCHMARK] Comparando Croston/SBA vs GRU...")
-df_compare = evaluate_croston_vs_gru(df_feat, model, scaler, FEATURE_COLS, SEQ_LEN)
+print("\n[BENCHMARK] Comparando GRU vs Croston/SBA con métricas de negocio...")
+df_compare, df_daily_pred = evaluate_business_benchmark(
+    df_feat, model, scaler, FEATURE_COLS, SEQ_LEN,
+    calibrator=calibrator, calibration_method=calibration_method,
+    clf_threshold=BEST_THRESHOLD, horizon=30, n_simulations=MC_ALL_SIMS,
+    max_skus=BENCHMARK_MAX_SKUS
+)
 
-print("\n" + "="*55)
-print("COMPARACIÓN CROSTON/SBA vs GRU (accuracy por SKU)")
-print("="*55)
-print(df_compare.set_index("sku").round(4).to_string())
-print(f"\nPromedio Croston/SBA accuracy: {df_compare['acc_croston_sba'].mean():.4f}")
-print(f"Promedio GRU accuracy        : {df_compare['acc_gru'].mean():.4f}")
+if df_compare.empty:
+    raise ValueError(
+        "No se pudo construir benchmark de negocio: no hay SKUs evaluables "
+        "(causas comunes: cutoff<seq_len, SKUs sin tramo de test o historial insuficiente)."
+    )
 
+df_compare.to_csv(ARTIFACT_DIR / "benchmark_business_metrics.csv", index=False)
+df_daily_pred.to_csv(ARTIFACT_DIR / "predicciones_por_sku.csv", index=False)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 9. SIMULACIÓN MONTE CARLO A 30 DÍAS
-# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "=" * 75)
+print("COMPARACIÓN GRU vs CROSTON/SBA (métricas de negocio)")
+print("=" * 75)
+print(df_compare[[
+    "sku", "mae_cum_consumo_gru", "mae_cum_consumo_croston",
+    "err_dia_agotamiento_gru", "err_dia_agotamiento_croston",
+    "err_prob_stockout_gru", "err_prob_stockout_croston"
+]].round(4).to_string(index=False))
+print(f"\nMAE consumo 30d      | GRU: {df_compare['mae_cum_consumo_gru'].mean():.4f} | "
+      f"Croston: {df_compare['mae_cum_consumo_croston'].mean():.4f}")
+print(f"Error día agotamiento| GRU: {df_compare['err_dia_agotamiento_gru'].mean():.4f} | "
+      f"Croston: {df_compare['err_dia_agotamiento_croston'].mean():.4f}")
+print(f"Error prob stockout  | GRU: {df_compare['err_prob_stockout_gru'].mean():.4f} | "
+      f"Croston: {df_compare['err_prob_stockout_croston'].mean():.4f}")
+
 
 def montecarlo_stockout(sku_id: str,
                         df_feat: pd.DataFrame,
@@ -584,218 +808,176 @@ def montecarlo_stockout(sku_id: str,
                         seq_len: int = 14,
                         horizon: int = 30,
                         n_simulations: int = 1000,
-                        clf_threshold: float = 0.4,
+                        calibrator_obj=None,
+                        calibration_method_name="raw",
                         seed: int = 0) -> dict:
-    """
-    Simula 30 días hacia adelante para un SKU usando la GRU.
-
-    Lógica de cada simulación:
-      1. Tomar la ventana histórica del SKU (últimos seq_len días).
-      2. Para cada día futuro d:
-         a. Predecir P(venta) y cantidad esperada con la GRU.
-         b. Samplear si hubo venta: Bernoulli(P(venta)).
-         c. Si hubo venta, samplear cantidad: Poisson(qty_pred).
-         d. Descontar del stock. Si stock <= 0 → stockout en día d.
-      3. Repetir n_simulations veces.
-      4. Calcular:
-         - prob_stockout: fracción de simulaciones con stockout
-         - día esperado de stockout (promedio condicional)
-         - stock final esperado
-    """
     rng = np.random.default_rng(seed)
-
     grp = df_feat[df_feat["sku"] == sku_id].sort_values("fecha").reset_index(drop=True)
     if len(grp) < seq_len:
         return {"error": "Datos insuficientes para la simulación"}
 
-    stock_inicial = grp["stock"].iloc[-1]
-    feats_hist = grp[feature_cols].values  # (n_dias, n_feat)
+    stock_inicial = float(grp["stock"].iloc[-1])
+    feats_hist = grp[feature_cols].values
+    stockout_days, final_stocks = [], []
 
-    stockout_days   = []
-    final_stocks    = []
-    n_stockouts     = 0
-
-    for sim in range(n_simulations):
+    for _ in range(n_simulations):
         stock = stock_inicial
-        # Ventana deslizante de features (copia para no modificar original)
         window = feats_hist[-seq_len:].copy().tolist()
         stockout_day = None
-
         for day in range(1, horizon + 1):
-            # Escalar ventana
             w_arr = np.array(window, dtype=np.float32)
-            w_sc  = scaler.transform(w_arr).reshape(1, seq_len, len(feature_cols))
-            w_sc  = w_sc.astype(np.float32)
-
+            w_sc = scaler.transform(w_arr).reshape(1, seq_len, len(feature_cols)).astype(np.float32)
             p_clf, qty_pred = model.predict(w_sc, verbose=0)
-            p_venta = float(p_clf[0, 0])
-            qty_mu  = max(0.0, float(qty_pred[0, 0]))
+            p_venta = apply_calibration([float(p_clf[0, 0])], calibrator_obj, calibration_method_name)[0]
+            qty_mu = max(0.0, float(qty_pred[0, 0]))
 
-            # Samplear evento de venta
             hay_venta = rng.random() < p_venta
-
             consumo_sim = 0
             if hay_venta and stock > 0:
-                # Poisson con media qty_mu, al menos 1
                 consumo_sim = max(1, rng.poisson(qty_mu if qty_mu > 0 else 1))
                 consumo_sim = min(consumo_sim, stock)
-                stock = stock - consumo_sim
+                stock -= consumo_sim
                 if stock <= 0:
                     stockout_day = day
                     stock = 0
-                    break  # agotado
+                    break
 
-            # Actualizar ventana: desplazar y agregar nuevo feature vector
-            # (aproximación: reciclamos el último vector con consumo actualizado)
             new_row = window[-1].copy()
-            # Índices de features: consumo_1d=0, consumo_7d=1, stock=6
-            new_row[0] = consumo_sim                      # consumo_1d
-            new_row[1] = sum([r[0] for r in window[-6:]]) + consumo_sim  # consumo_7d approx
-            new_row[6] = stock                             # stock_actual
+            new_row[0] = consumo_sim
+            new_row[1] = sum([r[0] for r in window[-6:]]) + consumo_sim
+            new_row[6] = stock
             window.pop(0)
             window.append(new_row)
 
         final_stocks.append(stock)
         if stockout_day is not None:
             stockout_days.append(stockout_day)
-            n_stockouts += 1
 
-    prob_stockout = n_stockouts / n_simulations
+    prob_stockout = len(stockout_days) / n_simulations
     avg_stockout_day = np.mean(stockout_days) if stockout_days else None
-    avg_final_stock  = np.mean(final_stocks)
-
     return {
-        "sku":              sku_id,
-        "stock_inicial":    stock_inicial,
+        "sku": sku_id,
+        "stock_inicial": stock_inicial,
         "prob_stockout_30d": round(prob_stockout, 4),
         "dia_esperado_agotamiento": round(avg_stockout_day, 1) if avg_stockout_day else "N/A",
-        "stock_final_esperado": round(avg_final_stock, 1),
-        "n_simulaciones":   n_simulations,
-        "n_stockouts":      n_stockouts,
-        "alerta": (
-            "🔴 CRÍTICO"  if prob_stockout > 0.7 else
-            "🟡 MODERADO" if prob_stockout > 0.3 else
-            "🟢 BAJO"
-        )
+        "stock_final_esperado": round(float(np.mean(final_stocks)), 1),
+        "n_simulaciones": n_simulations,
+        "n_stockouts": len(stockout_days),
+        "stockout_day_distribution": stockout_days,
+        "alerta": "🔴 CRÍTICO" if prob_stockout > 0.7 else ("🟡 MODERADO" if prob_stockout > 0.3 else "🟢 BAJO"),
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 10. DEMO: PROBAR CON UN SKU ESPECÍFICO
-# ─────────────────────────────────────────────────────────────────────────────
-
 TARGET_SKU = str(df_feat["sku"].iloc[0])
-
-print(f"\n{'='*55}")
-print(f"SIMULACIÓN MONTE CARLO — {TARGET_SKU}")
-print(f"{'='*55}")
-
+target_df = df_feat[df_feat["sku"] == TARGET_SKU].copy()
 resultado = montecarlo_stockout(
-    sku_id        = TARGET_SKU,
-    df_feat       = df_feat,
-    model         = model,
-    scaler        = scaler,
-    feature_cols  = FEATURE_COLS,
-    seq_len       = SEQ_LEN,
-    horizon       = 30,
-    n_simulations = 500,    # usa 1000 en producción; 500 para demo rápido
-    clf_threshold = 0.4
+    sku_id=TARGET_SKU, df_feat=df_feat, model=model, scaler=scaler,
+    feature_cols=FEATURE_COLS, seq_len=SEQ_LEN, horizon=30,
+    n_simulations=MC_TARGET_SIMS, calibrator_obj=calibrator,
+    calibration_method_name=calibration_method
 )
-
 if "error" in resultado:
     raise ValueError(f"No se pudo simular {TARGET_SKU}: {resultado['error']}")
 
-print(f"\n  SKU                     : {resultado['sku']}")
-print(f"  Stock inicial           : {resultado['stock_inicial']}")
-print(f"  Prob. agotamiento 30d   : {resultado['prob_stockout_30d']:.1%}")
-print(f"  Día esperado agotamiento: {resultado['dia_esperado_agotamiento']}")
-print(f"  Stock final esperado    : {resultado['stock_final_esperado']:.1f} unidades")
-print(f"  Nivel de alerta         : {resultado['alerta']}")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 11. RESUMEN PARA TODOS LOS SKUs
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_all_skus(df_feat, model, scaler, feature_cols, seq_len,
-                 n_simulations=300):
+def run_all_skus(df_feat, model, scaler, feature_cols, seq_len, n_simulations=300,
+                 calibrator_obj=None, calibration_method_name="raw"):
     resultados = []
     skus = df_feat["sku"].unique()
     print(f"\n[MC] Simulando {len(skus)} SKUs con {n_simulations} corridas c/u...")
-    for sku in skus:
+    for i, sku in enumerate(skus):
         r = montecarlo_stockout(
             sku_id=sku, df_feat=df_feat, model=model, scaler=scaler,
-            feature_cols=feature_cols, seq_len=seq_len,
-            horizon=30, n_simulations=n_simulations
+            feature_cols=feature_cols, seq_len=seq_len, horizon=30,
+            n_simulations=n_simulations, calibrator_obj=calibrator_obj,
+            calibration_method_name=calibration_method_name, seed=i
         )
         if "error" not in r:
             resultados.append(r)
-
-    df_res = pd.DataFrame(resultados)
-    df_res = df_res.sort_values("prob_stockout_30d", ascending=False)
+    df_res = pd.DataFrame(resultados).sort_values("prob_stockout_30d", ascending=False)
     return df_res
 
 
-df_resultados = run_all_skus(df_feat, model, scaler, FEATURE_COLS, SEQ_LEN,
-                              n_simulations=300)
+df_resultados = run_all_skus(
+    df_feat, model, scaler, FEATURE_COLS, SEQ_LEN,
+    n_simulations=MC_ALL_SIMS, calibrator_obj=calibrator, calibration_method_name=calibration_method
+)
+df_resultados.to_csv(ARTIFACT_DIR / "stockout_riesgo_skus.csv", index=False)
 
-print("\n" + "="*70)
-print("RANKING DE RIESGO DE AGOTAMIENTO (todos los SKUs)")
-print("="*70)
-print(df_resultados[["sku", "stock_inicial", "prob_stockout_30d",
-                      "dia_esperado_agotamiento", "stock_final_esperado",
-                      "alerta"]].to_string(index=False))
+sku_analysis = df_compare[["sku", "precision_gru", "recall_gru", "f1_gru", "fp_gru", "fn_gru", "sesgo_gru"]].copy()
+sku_analysis.to_csv(ARTIFACT_DIR / "analisis_sesgo_por_sku.csv", index=False)
 
+print("\nTop SKUs sobrepredicción/subpredicción:")
+print(sku_analysis.sort_values(["fp_gru", "fn_gru"], ascending=False).head(10).to_string(index=False))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 12. VISUALIZACIONES
-# ─────────────────────────────────────────────────────────────────────────────
+# Visualizaciones principales
+fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+fig.suptitle("GRU + Croston/SBA — Métricas de negocio para stockout", fontsize=14, fontweight="bold")
 
-fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-fig.suptitle("GRU + Croston/SBA — Predicción de Agotamiento de Inventario",
-             fontsize=14, fontweight="bold")
-
-# 12.1 Curva de pérdida
 ax = axes[0, 0]
-ax.plot(history.history["loss"],     label="Train loss", color="#3b82f6")
-ax.plot(history.history["val_loss"], label="Val loss",   color="#ef4444", linestyle="--")
-ax.set_title("Pérdida durante entrenamiento"); ax.set_xlabel("Época"); ax.set_ylabel("Loss")
-ax.legend(); ax.grid(alpha=0.3)
+if history is not None:
+    ax.plot(history.history["loss"], label="Train loss", color="#3b82f6")
+    ax.plot(history.history["val_loss"], label="Val loss", color="#ef4444", linestyle="--")
+else:
+    ax.text(0.5, 0.5, "Modelo cargado desde artefactos\n(sin reentrenar)", ha="center", va="center")
+ax.set_title("Pérdida de entrenamiento"); ax.set_xlabel("Época"); ax.set_ylabel("Loss"); ax.grid(alpha=0.3); ax.legend()
 
-# 12.2 Accuracy clasificación
 ax = axes[0, 1]
-ax.plot(history.history["output_clf_accuracy"],
-        label="Train acc", color="#10b981")
-ax.plot(history.history["val_output_clf_accuracy"],
-        label="Val acc",   color="#f59e0b", linestyle="--")
-ax.set_title("Accuracy clasificación"); ax.set_xlabel("Época")
-ax.legend(); ax.grid(alpha=0.3)
+pr, rc, _ = precision_recall_curve(y_clf_te.astype(int), pred_clf_te)
+ax.plot(rc, pr, color="#10b981", label="PR curve GRU")
+ax.set_title("Curva Precision-Recall (test)"); ax.set_xlabel("Recall"); ax.set_ylabel("Precision"); ax.grid(alpha=0.3); ax.legend()
 
-# 12.3 Comparación Croston vs GRU
 ax = axes[1, 0]
-x = np.arange(len(df_compare))
-width = 0.35
-ax.bar(x - width/2, df_compare["acc_croston_sba"], width,
-       label="Croston/SBA", color="#6366f1", alpha=0.8)
-ax.bar(x + width/2, df_compare["acc_gru"],         width,
-       label="GRU",         color="#22c55e", alpha=0.8)
-ax.set_xticks(x); ax.set_xticklabels(df_compare["sku"], rotation=45, ha="right", fontsize=7)
-ax.set_title("Accuracy por SKU: Croston/SBA vs GRU"); ax.legend(); ax.grid(alpha=0.3, axis="y")
+ax.hist(df_compare["err_dia_agotamiento_gru"], alpha=0.6, label="GRU", color="#22c55e")
+ax.hist(df_compare["err_dia_agotamiento_croston"], alpha=0.6, label="Croston/SBA", color="#6366f1")
+ax.set_title("Histograma error día agotamiento"); ax.set_xlabel("Error absoluto (días)"); ax.grid(alpha=0.3); ax.legend()
 
-# 12.4 Distribución probabilidades de stockout
 ax = axes[1, 1]
-colors = df_resultados["alerta"].map({
-    "🔴 CRÍTICO": "#ef4444", "🟡 MODERADO": "#f59e0b", "🟢 BAJO": "#22c55e"
-})
-ax.barh(df_resultados["sku"],
-        df_resultados["prob_stockout_30d"],
-        color=colors.values)
-ax.axvline(0.3, color="#f59e0b", linestyle="--", alpha=0.7, label="Umbral moderado")
-ax.axvline(0.7, color="#ef4444", linestyle="--", alpha=0.7, label="Umbral crítico")
-ax.set_xlabel("Probabilidad de agotamiento (30d)")
-ax.set_title("Riesgo de stockout por SKU"); ax.legend(); ax.grid(alpha=0.3, axis="x")
+daily_target = df_daily_pred[df_daily_pred["sku"] == TARGET_SKU].copy()
+if not daily_target.empty:
+    daily_target = daily_target.sort_values("fecha")
+    ax.plot(daily_target["fecha"], daily_target["consumo_real"].cumsum(), label="Consumo real acumulado", color="#111827")
+    ax.plot(daily_target["fecha"], daily_target["consumo_esperado_gru"].cumsum(), label="GRU acumulado", color="#22c55e")
+    ax.plot(daily_target["fecha"], daily_target["consumo_esperado_croston"].cumsum(), label="Croston acumulado", color="#6366f1")
+ax.set_title(f"Consumo real vs simulado ({TARGET_SKU})"); ax.grid(alpha=0.3); ax.legend()
 
 plt.tight_layout()
-plt.savefig("resultados_inventario.png", dpi=150, bbox_inches="tight")
-plt.show()
-print("\n[OK] Gráfica guardada en resultados_inventario.png")
+plt.savefig(ARTIFACT_DIR / "resultados_inventario.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+fig2, axes2 = plt.subplots(1, 2, figsize=(14, 5))
+if not daily_target.empty:
+    stock_ini = float(target_df["stock"].iloc[int(len(target_df) * TRAIN_CUTOFF_RATIO) - 1])
+    real_stock = stock_ini - daily_target["consumo_real"].cumsum()
+    gru_stock = stock_ini - daily_target["consumo_esperado_gru"].cumsum()
+    axes2[0].plot(daily_target["fecha"], real_stock, label="Stock real", color="#111827")
+    axes2[0].plot(daily_target["fecha"], gru_stock, label="Stock simulado GRU", color="#22c55e")
+axes2[0].set_title(f"Stock real vs simulado ({TARGET_SKU})"); axes2[0].grid(alpha=0.3); axes2[0].legend()
+
+sesgo_counts = sku_analysis["sesgo_gru"].value_counts()
+bias_color_map = {"sobrepredice": "#ef4444", "subpredice": "#f59e0b", "balanceado": "#22c55e"}
+axes2[1].bar(
+    sesgo_counts.index,
+    sesgo_counts.values,
+    color=[bias_color_map.get(cat, "#6b7280") for cat in sesgo_counts.index]
+)
+axes2[1].set_title("Sesgo de clasificación GRU por SKU"); axes2[1].grid(alpha=0.3, axis="y")
+plt.tight_layout()
+plt.savefig(ARTIFACT_DIR / "analisis_por_sku.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+summary = {
+    "artifact_dir": str(ARTIFACT_DIR.resolve()),
+    "best_threshold": BEST_THRESHOLD,
+    "calibration_method": calibration_method,
+    "mean_mae_cum_30d_gru": float(df_compare["mae_cum_consumo_gru"].mean()),
+    "mean_mae_cum_30d_croston": float(df_compare["mae_cum_consumo_croston"].mean()),
+    "mean_err_day_gru": float(df_compare["err_dia_agotamiento_gru"].mean()),
+    "mean_err_day_croston": float(df_compare["err_dia_agotamiento_croston"].mean()),
+    "mean_err_prob_gru": float(df_compare["err_prob_stockout_gru"].mean()),
+    "mean_err_prob_croston": float(df_compare["err_prob_stockout_croston"].mean()),
+}
+with open(ARTIFACT_DIR / "run_summary.json", "w", encoding="utf-8") as f:
+    json.dump(summary, f, ensure_ascii=False, indent=2)
+
+print(f"\n[OK] Artefactos, métricas y gráficas guardados en: {ARTIFACT_DIR.resolve()}")
