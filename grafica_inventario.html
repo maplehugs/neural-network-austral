@@ -1,0 +1,763 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Inventario — Evolución Total Unidades</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=DM+Sans:wght@300;400;600&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0b0f1a;
+    --surface:   #111827;
+    --border:    #1e2d40;
+    --accent:    #38bdf8;
+    --accent2:   #818cf8;
+    --text:      #e2e8f0;
+    --muted:     #64748b;
+    --up:        #34d399;
+    --down:      #f87171;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    min-height: 100vh;
+    padding: 40px 32px;
+  }
+
+  header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    margin-bottom: 40px;
+    gap: 20px;
+    flex-wrap: wrap;
+  }
+
+  .title-block h1 {
+    font-size: clamp(1.4rem, 3vw, 2rem);
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    line-height: 1.2;
+  }
+
+  .title-block p {
+    font-size: 0.85rem;
+    color: var(--muted);
+    margin-top: 6px;
+    font-family: 'DM Mono', monospace;
+  }
+
+  .kpi-row {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 32px;
+  }
+
+  .kpi {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 24px;
+    min-width: 180px;
+    flex: 1;
+  }
+
+  .kpi .label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--muted);
+    font-family: 'DM Mono', monospace;
+    margin-bottom: 8px;
+  }
+
+  .kpi .value {
+    font-size: 1.6rem;
+    font-weight: 600;
+    font-family: 'DM Mono', monospace;
+    color: var(--accent);
+  }
+
+  .kpi .delta {
+    font-size: 0.78rem;
+    margin-top: 4px;
+    font-family: 'DM Mono', monospace;
+  }
+
+  .delta.pos { color: var(--up); }
+  .delta.neg { color: var(--down); }
+  .delta.neutral { color: var(--muted); }
+
+  .chart-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 28px;
+    position: relative;
+  }
+
+  .chart-card h2 {
+    font-size: 0.85rem;
+    font-family: 'DM Mono', monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    margin-bottom: 24px;
+  }
+
+  .chart-wrap {
+    position: relative;
+    height: 380px;
+  }
+
+  .table-section {
+    margin-top: 32px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    overflow: hidden;
+  }
+
+  .table-section h2 {
+    font-size: 0.85rem;
+    font-family: 'DM Mono', monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    padding: 20px 24px 0;
+    margin-bottom: 16px;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: 'DM Mono', monospace;
+    font-size: 0.82rem;
+  }
+
+  thead tr {
+    background: rgba(56,189,248,0.06);
+    border-bottom: 1px solid var(--border);
+  }
+
+  thead th {
+    padding: 10px 24px;
+    text-align: left;
+    color: var(--muted);
+    font-weight: 400;
+    font-size: 0.72rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  thead th:not(:first-child) { text-align: right; }
+
+  tbody tr {
+    border-bottom: 1px solid rgba(30,45,64,0.5);
+    transition: background 0.15s;
+  }
+
+  tbody tr:hover { background: rgba(56,189,248,0.04); }
+  tbody tr:last-child { border-bottom: none; }
+
+  tbody td {
+    padding: 10px 24px;
+    color: var(--text);
+  }
+
+  tbody td:not(:first-child) { text-align: right; }
+
+  .badge-up   { color: var(--up); }
+  .badge-down { color: var(--down); }
+  .badge-eq   { color: var(--muted); }
+
+  .upload-section {
+    background: var(--surface);
+    border: 1px dashed var(--border);
+    border-radius: 16px;
+    padding: 32px;
+    text-align: center;
+    margin-bottom: 32px;
+    cursor: pointer;
+    transition: border-color 0.2s;
+  }
+
+  .upload-section:hover { border-color: var(--accent); }
+
+  .upload-section input { display: none; }
+
+  .upload-section p {
+    color: var(--muted);
+    font-size: 0.88rem;
+    margin-top: 8px;
+  }
+
+  .upload-section .icon {
+    font-size: 2rem;
+    margin-bottom: 8px;
+  }
+
+  .upload-section label {
+    cursor: pointer;
+    font-size: 0.9rem;
+    color: var(--accent);
+    font-weight: 500;
+  }
+
+  .empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--muted);
+  }
+
+  .empty-state .icon { font-size: 3rem; margin-bottom: 12px; }
+  .empty-state p { font-size: 0.9rem; }
+
+  .file-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 16px;
+    justify-content: center;
+  }
+
+  .file-tag {
+    background: rgba(56,189,248,0.1);
+    border: 1px solid rgba(56,189,248,0.2);
+    color: var(--accent);
+    font-family: 'DM Mono', monospace;
+    font-size: 0.72rem;
+    padding: 4px 10px;
+    border-radius: 6px;
+  }
+
+  #status {
+    font-family: 'DM Mono', monospace;
+    font-size: 0.78rem;
+    color: var(--muted);
+    margin-top: 10px;
+  }
+
+  .main-content { display: none; }
+
+  .controls {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+
+  .control {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 12px;
+  }
+
+  .control label {
+    display: block;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    font-family: 'DM Mono', monospace;
+    margin-bottom: 8px;
+  }
+
+  .control input,
+  .control select {
+    width: 100%;
+    background: #0b1220;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 10px;
+    font-family: 'DM Mono', monospace;
+    font-size: 0.82rem;
+  }
+
+  .hint {
+    margin-top: 8px;
+    color: var(--muted);
+    font-size: 0.75rem;
+    font-family: 'DM Mono', monospace;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="title-block">
+    <h1>Inventario Total</h1>
+    <p>Evolución de unidades en el tiempo</p>
+  </div>
+</header>
+
+<!-- Upload zone -->
+<div class="upload-section" id="dropZone">
+  <div class="icon">📂</div>
+  <label for="fileInput">Seleccionar archivos .xlsx</label>
+  <input type="file" id="fileInput" accept=".xlsx" multiple>
+  <p>O arrastrá los archivos acá · Formato esperado: <code style="color:var(--accent2)">D_M_YYYY.xlsx</code></p>
+  <div class="file-list" id="fileList"></div>
+  <div id="status"></div>
+</div>
+
+<div class="main-content" id="mainContent">
+  <div class="controls">
+    <div class="control">
+      <label for="viewMode">Vista</label>
+      <select id="viewMode">
+        <option value="total">Inventario total</option>
+        <option value="item">Por lente/codigo</option>
+      </select>
+    </div>
+    <div class="control">
+      <label for="itemSearch">Buscar lente/codigo</label>
+      <input id="itemSearch" type="text" placeholder="Ej: 4554 o Lente Azul" />
+      <div class="hint">Filtra el selector de abajo</div>
+    </div>
+    <div class="control">
+      <label for="itemSelect">Seleccion</label>
+      <select id="itemSelect" disabled>
+        <option value="">Primero subi archivos</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="kpi-row" id="kpiRow"></div>
+
+  <div class="chart-card">
+    <h2 id="chartTitle">Total Unidades / Fecha de corte</h2>
+    <div class="chart-wrap">
+      <canvas id="chart"></canvas>
+    </div>
+  </div>
+
+  <div class="table-section">
+    <h2>Detalle por fecha</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Fecha</th>
+          <th id="metricHeader">Total Unidades</th>
+          <th>Variación</th>
+          <th>Variación %</th>
+        </tr>
+      </thead>
+      <tbody id="tableBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script>
+function parseDateFromName(name) {
+  const m = name.match(/^(\d{1,2})_(\d{1,2})_(\d{4})/);
+  if (!m) return null;
+  const [_, d, mo, y] = m;
+  return new Date(+y, +mo - 1, +d);
+}
+
+function fmtDate(d) {
+  return d.toLocaleDateString('es-CO', { day: '2-digit', month: 'short', year: 'numeric' });
+}
+
+function fmtNum(n) {
+  return Number(n || 0).toLocaleString('es-CO');
+}
+
+function normKey(value) {
+  return String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[\s\.]/g, '').toLowerCase();
+}
+
+function findKey(row, candidates) {
+  const keys = Object.keys(row || {});
+  return keys.find((k) => candidates.includes(normKey(k))) || null;
+}
+
+function makeItemId(code, lens) {
+  const codePart = String(code || '').trim();
+  const lensPart = String(lens || '').trim();
+  if (codePart) return `code:${codePart}`;
+  if (lensPart) return `lens:${lensPart.toLowerCase()}`;
+  return null;
+}
+
+function makeItemLabel(code, lens) {
+  const codePart = String(code || '').trim();
+  const lensPart = String(lens || '').trim();
+  if (codePart && lensPart) return `${codePart} - ${lensPart}`;
+  if (codePart) return codePart;
+  return lensPart || 'Sin nombre';
+}
+
+function readXlsx(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const wb = XLSX.read(e.target.result, { type: 'array' });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(ws, { defval: null });
+        const sample = rows[0] || {};
+
+        const unitsKey = findKey(sample, ['tunid']);
+        if (!unitsKey) {
+          reject(new Error(`No se encontro columna T.Unid en ${file.name}`));
+          return;
+        }
+
+        const codeKey = findKey(sample, ['codigo', 'cod', 'referencia', 'sku', 'id']);
+        const lensKey = findKey(sample, ['lente', 'descripcion', 'producto', 'nombre']);
+
+        let total = 0;
+        const itemTotals = new Map();
+
+        rows.forEach((row) => {
+          const rawUnits = Number(row[unitsKey]);
+          const units = Number.isFinite(rawUnits) ? rawUnits : 0;
+          if (units === 0) return;
+
+          const code = codeKey ? row[codeKey] : null;
+          const lens = lensKey ? row[lensKey] : null;
+          const itemId = makeItemId(code, lens);
+
+          if (itemId) {
+            const prev = itemTotals.get(itemId) || {
+              id: itemId,
+              code: String(code || '').trim(),
+              lens: String(lens || '').trim(),
+              label: makeItemLabel(code, lens),
+              total: 0,
+            };
+            prev.total += units;
+            itemTotals.set(itemId, prev);
+          }
+
+          total += units;
+        });
+
+        resolve({ total, itemTotals });
+      } catch (err) {
+        reject(err);
+      }
+    };
+    reader.onerror = reject;
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+let chartInstance = null;
+const appState = {
+  data: [],
+  catalog: [],
+  mode: 'total',
+  selectedItemId: '',
+};
+
+function renderChart(labels, values, datasetLabel) {
+  const ctx = document.getElementById('chart').getContext('2d');
+  const gradient = ctx.createLinearGradient(0, 0, 0, 380);
+  gradient.addColorStop(0, 'rgba(56,189,248,0.25)');
+  gradient.addColorStop(1, 'rgba(56,189,248,0)');
+
+  if (chartInstance) chartInstance.destroy();
+
+  chartInstance = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        label: datasetLabel,
+        data: values,
+        borderColor: '#38bdf8',
+        backgroundColor: gradient,
+        borderWidth: 2.5,
+        pointBackgroundColor: '#38bdf8',
+        pointBorderColor: '#0b0f1a',
+        pointBorderWidth: 2,
+        pointRadius: 5,
+        pointHoverRadius: 7,
+        fill: true,
+        tension: 0.35,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#1e293b',
+          borderColor: '#334155',
+          borderWidth: 1,
+          titleColor: '#94a3b8',
+          bodyColor: '#e2e8f0',
+          titleFont: { family: 'DM Mono', size: 11 },
+          bodyFont: { family: 'DM Mono', size: 13 },
+          padding: 12,
+          callbacks: {
+            label: (ctx) => ` ${fmtNum(ctx.parsed.y)} unidades`,
+          },
+        },
+      },
+      scales: {
+        x: {
+          grid: { color: 'rgba(30,45,64,0.8)' },
+          ticks: { color: '#64748b', font: { family: 'DM Mono', size: 11 } },
+        },
+        y: {
+          grid: { color: 'rgba(30,45,64,0.8)' },
+          ticks: {
+            color: '#64748b',
+            font: { family: 'DM Mono', size: 11 },
+            callback: (v) => fmtNum(v),
+          },
+        },
+      },
+    },
+  });
+}
+
+function renderKPIs(data, metricLabel) {
+  const last = data[data.length - 1];
+  const first = data[0];
+  const prev = data.length >= 2 ? data[data.length - 2] : null;
+
+  const delta = prev ? last.total - prev.total : 0;
+  const totalDelta = last.total - first.total;
+  const totalPct = first.total ? (totalDelta / first.total) * 100 : 0;
+
+  const kpis = [
+    { label: 'Ultima fecha', value: fmtDate(last.date), delta: null },
+    {
+      label: `${metricLabel} (ultimo)`,
+      value: fmtNum(last.total),
+      delta: prev ? `${delta >= 0 ? '+' : ''}${fmtNum(delta)} vs anterior` : null,
+      cls: delta >= 0 ? 'pos' : 'neg',
+    },
+    {
+      label: 'Variacion periodo completo',
+      value: `${totalDelta >= 0 ? '+' : ''}${fmtNum(totalDelta)}`,
+      delta: `${totalPct >= 0 ? '+' : ''}${totalPct.toFixed(1)}%`,
+      cls: totalDelta >= 0 ? 'pos' : 'neg',
+    },
+    { label: 'Fechas cargadas', value: data.length, delta: null },
+  ];
+
+  document.getElementById('kpiRow').innerHTML = kpis.map((k) => `
+    <div class="kpi">
+      <div class="label">${k.label}</div>
+      <div class="value">${k.value}</div>
+      ${k.delta ? `<div class="delta ${k.cls || 'neutral'}">${k.delta}</div>` : ''}
+    </div>
+  `).join('');
+}
+
+function renderTable(data) {
+  const tbody = document.getElementById('tableBody');
+  tbody.innerHTML = data.map((row, i) => {
+    const prev = i > 0 ? data[i - 1] : null;
+    const delta = prev ? row.total - prev.total : null;
+    const pct = prev && prev.total ? (delta / prev.total) * 100 : null;
+    const cls = delta === null ? 'badge-eq' : delta > 0 ? 'badge-up' : delta < 0 ? 'badge-down' : 'badge-eq';
+    const arrow = delta === null ? '-' : delta > 0 ? '▲' : delta < 0 ? '▼' : '-';
+
+    return `
+      <tr>
+        <td>${fmtDate(row.date)}</td>
+        <td>${fmtNum(row.total)}</td>
+        <td class="${cls}">${delta !== null ? `${arrow} ${fmtNum(Math.abs(delta))}` : '-'}</td>
+        <td class="${cls}">${pct !== null ? `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%` : '-'}</td>
+      </tr>
+    `;
+  }).join('');
+}
+
+function getSelectedItem() {
+  return appState.catalog.find((it) => it.id === appState.selectedItemId) || null;
+}
+
+function computeSeries() {
+  if (appState.mode === 'item') {
+    const selected = getSelectedItem();
+    if (!selected) return [];
+    return appState.data.map((d) => ({
+      date: d.date,
+      total: d.itemTotals.get(selected.id)?.total || 0,
+    }));
+  }
+
+  return appState.data.map((d) => ({ date: d.date, total: d.total }));
+}
+
+function updateItemOptions(searchText = '') {
+  const select = document.getElementById('itemSelect');
+  const query = String(searchText || '').trim().toLowerCase();
+  const filtered = appState.catalog.filter((item) => !query || item.search.includes(query));
+
+  if (!filtered.length) {
+    select.innerHTML = '<option value="">Sin coincidencias</option>';
+    return;
+  }
+
+  select.innerHTML = filtered.map((item) => `<option value="${item.id}">${item.label}</option>`).join('');
+  if (!filtered.some((it) => it.id === appState.selectedItemId)) {
+    appState.selectedItemId = filtered[0].id;
+  }
+  select.value = appState.selectedItemId;
+}
+
+function refreshView() {
+  if (!appState.data.length) return;
+
+  const status = document.getElementById('status');
+  const metricHeader = document.getElementById('metricHeader');
+  const chartTitle = document.getElementById('chartTitle');
+
+  const series = computeSeries();
+  if (!series.length) {
+    status.textContent = 'Selecciona un lente/codigo para ver su curva.';
+    return;
+  }
+
+  const labels = series.map((d) => fmtDate(d.date));
+  const values = series.map((d) => d.total);
+
+  if (appState.mode === 'item') {
+    const selected = getSelectedItem();
+    const label = selected ? selected.label : 'Lente';
+    metricHeader.textContent = 'Unidades del lente';
+    chartTitle.textContent = `Unidades por fecha: ${label}`;
+    renderChart(labels, values, `Unidades - ${label}`);
+    renderKPIs(series, 'Unidades lente');
+  } else {
+    metricHeader.textContent = 'Total Unidades';
+    chartTitle.textContent = 'Total Unidades / Fecha de corte';
+    renderChart(labels, values, 'Total Unidades');
+    renderKPIs(series, 'Total unidades');
+  }
+
+  renderTable(series);
+  status.textContent = `✓ Listo — ${series.length} fechas cargadas`;
+}
+
+async function processFiles(files) {
+  const status = document.getElementById('status');
+  const fileList = document.getElementById('fileList');
+  const mainContent = document.getElementById('mainContent');
+  const itemSelect = document.getElementById('itemSelect');
+  const itemSearch = document.getElementById('itemSearch');
+
+  fileList.innerHTML = '';
+
+  const items = [];
+  for (const f of files) {
+    const date = parseDateFromName(f.name);
+    if (!date) {
+      status.textContent = `⚠ '${f.name}' no tiene formato D_M_YYYY — se omite`;
+      continue;
+    }
+    items.push({ file: f, date });
+  }
+
+  if (!items.length) {
+    status.textContent = '⚠ Ningun archivo con formato valido (D_M_YYYY.xlsx)';
+    return;
+  }
+
+  items.sort((a, b) => a.date - b.date);
+  items.forEach((it) => {
+    const tag = document.createElement('span');
+    tag.className = 'file-tag';
+    tag.textContent = it.file.name;
+    fileList.appendChild(tag);
+  });
+
+  status.textContent = `Procesando ${items.length} archivo(s)...`;
+
+  const data = [];
+  const catalogMap = new Map();
+  for (const it of items) {
+    try {
+      const parsed = await readXlsx(it.file);
+      data.push({ date: it.date, total: parsed.total, itemTotals: parsed.itemTotals });
+
+      parsed.itemTotals.forEach((entry) => {
+        if (!catalogMap.has(entry.id)) {
+          catalogMap.set(entry.id, {
+            id: entry.id,
+            label: entry.label,
+            search: `${entry.code} ${entry.lens} ${entry.label}`.toLowerCase(),
+          });
+        }
+      });
+
+      status.textContent = `✓ ${data.length}/${items.length} procesados`;
+    } catch (e) {
+      status.textContent = `⚠ Error en ${it.file.name}: ${e.message}`;
+    }
+  }
+
+  if (!data.length) return;
+
+  appState.data = data;
+  appState.catalog = Array.from(catalogMap.values()).sort((a, b) => a.label.localeCompare(b.label, 'es'));
+  appState.mode = 'total';
+  appState.selectedItemId = appState.catalog.length ? appState.catalog[0].id : '';
+
+  itemSelect.disabled = !appState.catalog.length;
+  itemSearch.value = '';
+  updateItemOptions('');
+
+  mainContent.style.display = 'block';
+  refreshView();
+}
+
+document.getElementById('viewMode').addEventListener('change', (e) => {
+  appState.mode = e.target.value;
+  refreshView();
+});
+
+document.getElementById('itemSearch').addEventListener('input', (e) => {
+  updateItemOptions(e.target.value);
+  if (appState.mode === 'item') refreshView();
+});
+
+document.getElementById('itemSelect').addEventListener('change', (e) => {
+  appState.selectedItemId = e.target.value;
+  if (appState.mode === 'item') refreshView();
+});
+
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  if (e.target.files.length) processFiles(Array.from(e.target.files));
+});
+
+const dropZone = document.getElementById('dropZone');
+dropZone.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  dropZone.style.borderColor = 'var(--accent)';
+});
+
+dropZone.addEventListener('dragleave', () => {
+  dropZone.style.borderColor = 'var(--border)';
+});
+
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.style.borderColor = 'var(--border)';
+  const files = Array.from(e.dataTransfer.files).filter((f) => f.name.endsWith('.xlsx'));
+  if (files.length) processFiles(files);
+});
+</script>
+</body>
+</html>
